@@ -12,6 +12,5 @@
         "serayuzgur.crates"
       ]
     }
-  },
-  "postCreateCommand": "cargo check"
+  }
 }
