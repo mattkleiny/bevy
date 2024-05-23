@@ -19,6 +19,15 @@ pub struct IRect {
 }
 
 impl IRect {
+    /// An empty `IRect`, represented by maximum and minimum corner points
+    /// with `max == IVec2::MIN` and `min == IVec2::MAX`, so the
+    /// rect has an extremely large negative size.
+    /// This is useful, because when taking a union B of a non-empty `IRect` A and
+    /// this empty `IRect`, B will simply equal A.
+    pub const EMPTY: Self = Self {
+        max: IVec2::MIN,
+        min: IVec2::MAX,
+    };
     /// Create a new rectangle from two corner points.
     ///
     /// The two points do not need to be the minimum and/or maximum corners.
@@ -26,7 +35,7 @@ impl IRect {
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```
     /// # use bevy_math::IRect;
     /// let r = IRect::new(0, 4, 10, 6); // w=10 h=2
     /// let r = IRect::new(2, 3, 5, -1); // w=3 h=4
@@ -43,7 +52,7 @@ impl IRect {
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```
     /// # use bevy_math::{IRect, IVec2};
     /// // Unit rect from [0,0] to [1,1]
     /// let r = IRect::from_corners(IVec2::ZERO, IVec2::ONE); // w=1 h=1
@@ -70,7 +79,7 @@ impl IRect {
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```
     /// # use bevy_math::{IRect, IVec2};
     /// let r = IRect::from_center_size(IVec2::ZERO, IVec2::new(3, 2)); // w=2 h=2
     /// assert_eq!(r.min, IVec2::splat(-1));
@@ -91,7 +100,7 @@ impl IRect {
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```
     /// # use bevy_math::{IRect, IVec2};
     /// let r = IRect::from_center_half_size(IVec2::ZERO, IVec2::ONE); // w=2 h=2
     /// assert_eq!(r.min, IVec2::splat(-1));
@@ -113,7 +122,7 @@ impl IRect {
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```
     /// # use bevy_math::{IRect, IVec2};
     /// let r = IRect::from_corners(IVec2::ZERO, IVec2::new(0, 1)); // w=0 h=1
     /// assert!(r.is_empty());
@@ -127,7 +136,7 @@ impl IRect {
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```
     /// # use bevy_math::IRect;
     /// let r = IRect::new(0, 0, 5, 1); // w=5 h=1
     /// assert_eq!(r.width(), 5);
@@ -141,7 +150,7 @@ impl IRect {
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```
     /// # use bevy_math::IRect;
     /// let r = IRect::new(0, 0, 5, 1); // w=5 h=1
     /// assert_eq!(r.height(), 1);
@@ -155,7 +164,7 @@ impl IRect {
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```
     /// # use bevy_math::{IRect, IVec2};
     /// let r = IRect::new(0, 0, 5, 1); // w=5 h=1
     /// assert_eq!(r.size(), IVec2::new(5, 1));
@@ -173,7 +182,7 @@ impl IRect {
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```
     /// # use bevy_math::{IRect, IVec2};
     /// let r = IRect::new(0, 0, 4, 3); // w=4 h=3
     /// assert_eq!(r.half_size(), IVec2::new(2, 1));
@@ -191,7 +200,7 @@ impl IRect {
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```
     /// # use bevy_math::{IRect, IVec2};
     /// let r = IRect::new(0, 0, 5, 2); // w=5 h=2
     /// assert_eq!(r.center(), IVec2::new(2, 1));
@@ -205,7 +214,7 @@ impl IRect {
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```
     /// # use bevy_math::IRect;
     /// let r = IRect::new(0, 0, 5, 1); // w=5 h=1
     /// assert!(r.contains(r.center()));
@@ -223,7 +232,7 @@ impl IRect {
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```
     /// # use bevy_math::{IRect, IVec2};
     /// let r1 = IRect::new(0, 0, 5, 1); // w=5 h=1
     /// let r2 = IRect::new(1, -1, 3, 3); // w=2 h=4
@@ -246,7 +255,7 @@ impl IRect {
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```
     /// # use bevy_math::{IRect, IVec2};
     /// let r = IRect::new(0, 0, 5, 1); // w=5 h=1
     /// let u = r.union_point(IVec2::new(3, 6));
@@ -269,7 +278,7 @@ impl IRect {
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```
     /// # use bevy_math::{IRect, IVec2};
     /// let r1 = IRect::new(0, 0, 5, 1); // w=5 h=1
     /// let r2 = IRect::new(1, -1, 3, 3); // w=2 h=4
@@ -289,31 +298,31 @@ impl IRect {
         r
     }
 
-    /// Create a new rectangle with a constant inset.
+    /// Create a new rectangle by expanding it evenly on all sides.
     ///
-    /// The inset is the extra border on all sides. A positive inset produces a larger rectangle,
-    /// while a negative inset is allowed and produces a smaller rectangle. If the inset is negative
-    /// and its absolute value is larger than the rectangle half-size, the created rectangle is empty.
+    /// A positive expansion value produces a larger rectangle,
+    /// while a negative expansion value produces a smaller rectangle.
+    /// If this would result in zero or negative width or height, [`IRect::EMPTY`] is returned instead.
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```
     /// # use bevy_math::{IRect, IVec2};
     /// let r = IRect::new(0, 0, 5, 1); // w=5 h=1
-    /// let r2 = r.inset(3); // w=11 h=7
+    /// let r2 = r.inflate(3); // w=11 h=7
     /// assert_eq!(r2.min, IVec2::splat(-3));
     /// assert_eq!(r2.max, IVec2::new(8, 4));
     ///
     /// let r = IRect::new(0, -1, 4, 3); // w=4 h=4
-    /// let r2 = r.inset(-1); // w=2 h=2
+    /// let r2 = r.inflate(-1); // w=2 h=2
     /// assert_eq!(r2.min, IVec2::new(1, 0));
     /// assert_eq!(r2.max, IVec2::new(3, 2));
     /// ```
     #[inline]
-    pub fn inset(&self, inset: i32) -> Self {
+    pub fn inflate(&self, expansion: i32) -> Self {
         let mut r = Self {
-            min: self.min - inset,
-            max: self.max + inset,
+            min: self.min - expansion,
+            max: self.max + expansion,
         };
         // Collapse min over max to enforce invariants and ensure e.g. width() or
         // height() never return a negative value.
@@ -448,10 +457,10 @@ mod tests {
     }
 
     #[test]
-    fn rect_inset() {
+    fn rect_inflate() {
         let r = IRect::from_center_size(IVec2::ZERO, IVec2::splat(4)); // [-2,-2] - [2,2]
 
-        let r2 = r.inset(2);
+        let r2 = r.inflate(2);
         assert_eq!(r2.min, IVec2::new(-4, -4));
         assert_eq!(r2.max, IVec2::new(4, 4));
     }

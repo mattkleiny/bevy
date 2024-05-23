@@ -34,7 +34,7 @@ pub fn sync_simple_transforms(
         });
     // Update orphaned entities.
     let mut query = query.p1();
-    let mut iter = query.iter_many_mut(orphaned.iter());
+    let mut iter = query.iter_many_mut(orphaned.read());
     while let Some((transform, mut global_transform)) = iter.fetch_next() {
         if !transform.is_changed() && !global_transform.is_added() {
             *global_transform = GlobalTransform::from(*transform);
@@ -57,7 +57,7 @@ pub fn propagate_transforms(
     mut orphaned_entities: Local<Vec<Entity>>,
 ) {
     orphaned_entities.clear();
-    orphaned_entities.extend(orphaned.iter());
+    orphaned_entities.extend(orphaned.read());
     orphaned_entities.sort_unstable();
     root_query.par_iter_mut().for_each(
         |(entity, children, transform, mut global_transform)| {
@@ -79,6 +79,7 @@ pub fn propagate_transforms(
                 // - Since each root entity is unique and the hierarchy is consistent and forest-like,
                 //   other root entities' `propagate_recursive` calls will not conflict with this one.
                 // - Since this is the only place where `transform_query` gets used, there will be no conflicting fetches elsewhere.
+                #[allow(unsafe_code)]
                 unsafe {
                     propagate_recursive(
                         &global_transform,
@@ -106,6 +107,7 @@ pub fn propagate_transforms(
 /// nor any of its descendants.
 /// - The caller must ensure that the hierarchy leading to `entity`
 /// is well-formed and must remain as a tree or a forest. Each entity must have at most one parent.
+#[allow(unsafe_code)]
 unsafe fn propagate_recursive(
     parent: &GlobalTransform,
     transform_query: &Query<
@@ -182,18 +184,17 @@ unsafe fn propagate_recursive(
 mod test {
     use bevy_app::prelude::*;
     use bevy_ecs::prelude::*;
-    use bevy_ecs::system::CommandQueue;
+    use bevy_ecs::world::CommandQueue;
     use bevy_math::{vec3, Vec3};
     use bevy_tasks::{ComputeTaskPool, TaskPool};
 
-    use crate::components::{GlobalTransform, Transform};
     use crate::systems::*;
     use crate::TransformBundle;
-    use bevy_hierarchy::{BuildChildren, BuildWorldChildren, Children, Parent};
+    use bevy_hierarchy::{BuildChildren, BuildWorldChildren};
 
     #[test]
     fn correct_parent_removed() {
-        ComputeTaskPool::init(TaskPool::default);
+        ComputeTaskPool::get_or_init(TaskPool::default);
         let mut world = World::default();
         let offset_global_transform =
             |offset| GlobalTransform::from(Transform::from_xyz(offset, offset, offset));
@@ -248,7 +249,7 @@ mod test {
 
     #[test]
     fn did_propagate() {
-        ComputeTaskPool::init(TaskPool::default);
+        ComputeTaskPool::get_or_init(TaskPool::default);
         let mut world = World::default();
 
         let mut schedule = Schedule::default();
@@ -326,7 +327,7 @@ mod test {
 
     #[test]
     fn correct_children() {
-        ComputeTaskPool::init(TaskPool::default);
+        ComputeTaskPool::get_or_init(TaskPool::default);
         let mut world = World::default();
 
         let mut schedule = Schedule::default();
@@ -404,7 +405,7 @@ mod test {
     #[test]
     fn correct_transforms_when_no_children() {
         let mut app = App::new();
-        ComputeTaskPool::init(TaskPool::default);
+        ComputeTaskPool::get_or_init(TaskPool::default);
 
         app.add_systems(Update, (sync_simple_transforms, propagate_transforms));
 
@@ -414,7 +415,7 @@ mod test {
         let mut child = Entity::from_raw(0);
         let mut grandchild = Entity::from_raw(1);
         let parent = app
-            .world
+            .world_mut()
             .spawn((
                 Transform::from_translation(translation),
                 GlobalTransform::IDENTITY,
@@ -432,13 +433,16 @@ mod test {
         app.update();
 
         // check the `Children` structure is spawned
-        assert_eq!(&**app.world.get::<Children>(parent).unwrap(), &[child]);
-        assert_eq!(&**app.world.get::<Children>(child).unwrap(), &[grandchild]);
+        assert_eq!(&**app.world().get::<Children>(parent).unwrap(), &[child]);
+        assert_eq!(
+            &**app.world().get::<Children>(child).unwrap(),
+            &[grandchild]
+        );
         // Note that at this point, the `GlobalTransform`s will not have updated yet, due to `Commands` delay
         app.update();
 
-        let mut state = app.world.query::<&GlobalTransform>();
-        for global in state.iter(&app.world) {
+        let mut state = app.world_mut().query::<&GlobalTransform>();
+        for global in state.iter(app.world()) {
             assert_eq!(global, &GlobalTransform::from_translation(translation));
         }
     }
@@ -446,7 +450,7 @@ mod test {
     #[test]
     #[should_panic]
     fn panic_when_hierarchy_cycle() {
-        ComputeTaskPool::init(TaskPool::default);
+        ComputeTaskPool::get_or_init(TaskPool::default);
         // We cannot directly edit Parent and Children, so we use a temp world to break
         // the hierarchy's invariants.
         let mut temp = World::new();
@@ -466,16 +470,16 @@ mod test {
         }
 
         let (temp_child, temp_grandchild) = setup_world(&mut temp);
-        let (child, grandchild) = setup_world(&mut app.world);
+        let (child, grandchild) = setup_world(app.world_mut());
 
         assert_eq!(temp_child, child);
         assert_eq!(temp_grandchild, grandchild);
 
-        app.world
+        app.world_mut()
             .spawn(TransformBundle::IDENTITY)
             .push_children(&[child]);
         std::mem::swap(
-            &mut *app.world.get_mut::<Parent>(child).unwrap(),
+            &mut *app.world_mut().get_mut::<Parent>(child).unwrap(),
             &mut *temp.get_mut::<Parent>(grandchild).unwrap(),
         );
 

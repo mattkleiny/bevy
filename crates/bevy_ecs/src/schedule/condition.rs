@@ -10,8 +10,24 @@ pub type BoxedCondition<In = ()> = Box<dyn ReadOnlySystem<In = In, Out = bool>>;
 
 /// A system that determines if one or more scheduled systems should run.
 ///
-/// Implemented for functions and closures that convert into [`System<Out=bool>`](crate::system::System)
+/// Implemented for functions and closures that convert into [`System<Out=bool>`](System)
 /// with [read-only](crate::system::ReadOnlySystemParam) parameters.
+///
+/// # Marker type parameter
+///
+/// `Condition` trait has `Marker` type parameter, which has no special meaning,
+/// but exists to work around the limitation of Rust's trait system.
+///
+/// Type parameter in return type can be set to `<()>` by calling [`IntoSystem::into_system`],
+/// but usually have to be specified when passing a condition to a function.
+///
+/// ```
+/// # use bevy_ecs::schedule::Condition;
+/// # use bevy_ecs::system::IntoSystem;
+/// fn not_condition<Marker>(a: impl Condition<Marker>) -> impl Condition<()> {
+///    IntoSystem::into_system(a.map(|x| !x))
+/// }
+/// ```
 ///
 /// # Examples
 /// A condition that returns true every other time it's called.
@@ -91,7 +107,7 @@ pub trait Condition<Marker, In = ()>: sealed::Condition<Marker, In> {
     /// # fn my_system() {}
     /// app.add_systems(
     ///     // `resource_equals` will only get run if the resource `R` exists.
-    ///     my_system.run_if(resource_exists::<R>().and_then(resource_equals(R(0)))),
+    ///     my_system.run_if(resource_exists::<R>.and_then(resource_equals(R(0)))),
     /// );
     /// # app.run(&mut world);
     /// ```
@@ -129,7 +145,7 @@ pub trait Condition<Marker, In = ()>: sealed::Condition<Marker, In> {
     /// # fn my_system(mut c: ResMut<C>) { c.0 = true; }
     /// app.add_systems(
     ///     // Only run the system if either `A` or `B` exist.
-    ///     my_system.run_if(resource_exists::<A>().or_else(resource_exists::<B>())),
+    ///     my_system.run_if(resource_exists::<A>.or_else(resource_exists::<B>)),
     /// );
     /// #
     /// # world.insert_resource(C(false));
@@ -184,7 +200,6 @@ pub mod common_conditions {
         event::{Event, EventReader},
         prelude::{Component, Query, With},
         removal_detection::RemovedComponents,
-        schedule::{State, States},
         system::{IntoSystem, Res, Resource, System},
     };
 
@@ -229,7 +244,7 @@ pub mod common_conditions {
         }
     }
 
-    /// Generates a [`Condition`](super::Condition)-satisfying closure that returns `true`
+    /// A [`Condition`](super::Condition)-satisfying system that returns `true`
     /// if the resource exists.
     ///
     /// # Example
@@ -242,7 +257,7 @@ pub mod common_conditions {
     /// # let mut world = World::new();
     /// app.add_systems(
     ///     // `resource_exists` will only return true if the given resource exists in the world
-    ///     my_system.run_if(resource_exists::<Counter>()),
+    ///     my_system.run_if(resource_exists::<Counter>),
     /// );
     ///
     /// fn my_system(mut counter: ResMut<Counter>) {
@@ -257,11 +272,11 @@ pub mod common_conditions {
     /// app.run(&mut world);
     /// assert_eq!(world.resource::<Counter>().0, 1);
     /// ```
-    pub fn resource_exists<T>() -> impl FnMut(Option<Res<T>>) -> bool + Clone
+    pub fn resource_exists<T>(res: Option<Res<T>>) -> bool
     where
         T: Resource,
     {
-        move |res: Option<Res<T>>| res.is_some()
+        res.is_some()
     }
 
     /// Generates a [`Condition`](super::Condition)-satisfying closure that returns `true`
@@ -349,7 +364,7 @@ pub mod common_conditions {
         }
     }
 
-    /// Generates a [`Condition`](super::Condition)-satisfying closure that returns `true`
+    /// A [`Condition`](super::Condition)-satisfying system that returns `true`
     /// if the resource of the given type has been added since the condition was last checked.
     ///
     /// # Example
@@ -363,7 +378,7 @@ pub mod common_conditions {
     /// app.add_systems(
     ///     // `resource_added` will only return true if the
     ///     // given resource was just added
-    ///     my_system.run_if(resource_added::<Counter>()),
+    ///     my_system.run_if(resource_added::<Counter>),
     /// );
     ///
     /// fn my_system(mut counter: ResMut<Counter>) {
@@ -380,17 +395,17 @@ pub mod common_conditions {
     /// app.run(&mut world);
     /// assert_eq!(world.resource::<Counter>().0, 1);
     /// ```
-    pub fn resource_added<T>() -> impl FnMut(Option<Res<T>>) -> bool + Clone
+    pub fn resource_added<T>(res: Option<Res<T>>) -> bool
     where
         T: Resource,
     {
-        move |res: Option<Res<T>>| match res {
+        match res {
             Some(res) => res.is_added(),
             None => false,
         }
     }
 
-    /// Generates a [`Condition`](super::Condition)-satisfying closure that returns `true`
+    /// A [`Condition`](super::Condition)-satisfying system that returns `true`
     /// if the resource of the given type has had its value changed since the condition
     /// was last checked.
     ///
@@ -415,11 +430,11 @@ pub mod common_conditions {
     ///     // `resource_changed` will only return true if the
     ///     // given resource was just changed (or added)
     ///     my_system.run_if(
-    ///         resource_changed::<Counter>()
+    ///         resource_changed::<Counter>
     ///         // By default detecting changes will also trigger if the resource was
     ///         // just added, this won't work with my example so I will add a second
     ///         // condition to make sure the resource wasn't just added
-    ///         .and_then(not(resource_added::<Counter>()))
+    ///         .and_then(not(resource_added::<Counter>))
     ///     ),
     /// );
     ///
@@ -437,14 +452,14 @@ pub mod common_conditions {
     /// app.run(&mut world);
     /// assert_eq!(world.resource::<Counter>().0, 51);
     /// ```
-    pub fn resource_changed<T>() -> impl FnMut(Res<T>) -> bool + Clone
+    pub fn resource_changed<T>(res: Res<T>) -> bool
     where
         T: Resource,
     {
-        move |res: Res<T>| res.is_changed()
+        res.is_changed()
     }
 
-    /// Generates a [`Condition`](super::Condition)-satisfying closure that returns `true`
+    /// A [`Condition`](super::Condition)-satisfying system that returns `true`
     /// if the resource of the given type has had its value changed since the condition
     /// was last checked.
     ///
@@ -468,11 +483,11 @@ pub mod common_conditions {
     ///     // `resource_exists_and_changed` will only return true if the
     ///     // given resource exists and was just changed (or added)
     ///     my_system.run_if(
-    ///         resource_exists_and_changed::<Counter>()
+    ///         resource_exists_and_changed::<Counter>
     ///         // By default detecting changes will also trigger if the resource was
     ///         // just added, this won't work with my example so I will add a second
     ///         // condition to make sure the resource wasn't just added
-    ///         .and_then(not(resource_added::<Counter>()))
+    ///         .and_then(not(resource_added::<Counter>))
     ///     ),
     /// );
     ///
@@ -494,11 +509,11 @@ pub mod common_conditions {
     /// app.run(&mut world);
     /// assert_eq!(world.resource::<Counter>().0, 51);
     /// ```
-    pub fn resource_exists_and_changed<T>() -> impl FnMut(Option<Res<T>>) -> bool + Clone
+    pub fn resource_exists_and_changed<T>(res: Option<Res<T>>) -> bool
     where
         T: Resource,
     {
-        move |res: Option<Res<T>>| match res {
+        match res {
             Some(res) => res.is_changed(),
             None => false,
         }
@@ -534,7 +549,7 @@ pub mod common_conditions {
     ///         // By default detecting changes will also trigger if the resource was
     ///         // just added, this won't work with my example so I will add a second
     ///         // condition to make sure the resource wasn't just added
-    ///         .and_then(not(resource_added::<Counter>()))
+    ///         .and_then(not(resource_added::<Counter>))
     ///     ),
     /// );
     ///
@@ -640,221 +655,6 @@ pub mod common_conditions {
     }
 
     /// Generates a [`Condition`](super::Condition)-satisfying closure that returns `true`
-    /// if the state machine exists.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// # use bevy_ecs::prelude::*;
-    /// # #[derive(Resource, Default)]
-    /// # struct Counter(u8);
-    /// # let mut app = Schedule::default();
-    /// # let mut world = World::new();
-    /// # world.init_resource::<Counter>();
-    /// #[derive(States, Clone, Copy, Default, Eq, PartialEq, Hash, Debug)]
-    /// enum GameState {
-    ///     #[default]
-    ///     Playing,
-    ///     Paused,
-    /// }
-    ///
-    /// app.add_systems(
-    ///     // `state_exists` will only return true if the
-    ///     // given state exists
-    ///     my_system.run_if(state_exists::<GameState>()),
-    /// );
-    ///
-    /// fn my_system(mut counter: ResMut<Counter>) {
-    ///     counter.0 += 1;
-    /// }
-    ///
-    /// // `GameState` does not yet exist `my_system` won't run
-    /// app.run(&mut world);
-    /// assert_eq!(world.resource::<Counter>().0, 0);
-    ///
-    /// world.init_resource::<State<GameState>>();
-    ///
-    /// // `GameState` now exists so `my_system` will run
-    /// app.run(&mut world);
-    /// assert_eq!(world.resource::<Counter>().0, 1);
-    /// ```
-    pub fn state_exists<S: States>() -> impl FnMut(Option<Res<State<S>>>) -> bool + Clone {
-        move |current_state: Option<Res<State<S>>>| current_state.is_some()
-    }
-
-    /// Generates a [`Condition`](super::Condition)-satisfying closure that returns `true`
-    /// if the state machine is currently in `state`.
-    ///
-    /// # Panics
-    ///
-    /// The condition will panic if the resource does not exist.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// # use bevy_ecs::prelude::*;
-    /// # #[derive(Resource, Default)]
-    /// # struct Counter(u8);
-    /// # let mut app = Schedule::default();
-    /// # let mut world = World::new();
-    /// # world.init_resource::<Counter>();
-    /// #[derive(States, Clone, Copy, Default, Eq, PartialEq, Hash, Debug)]
-    /// enum GameState {
-    ///     #[default]
-    ///     Playing,
-    ///     Paused,
-    /// }
-    ///
-    /// world.init_resource::<State<GameState>>();
-    ///
-    /// app.add_systems((
-    ///     // `in_state` will only return true if the
-    ///     // given state equals the given value
-    ///     play_system.run_if(in_state(GameState::Playing)),
-    ///     pause_system.run_if(in_state(GameState::Paused)),
-    /// ));
-    ///
-    /// fn play_system(mut counter: ResMut<Counter>) {
-    ///     counter.0 += 1;
-    /// }
-    ///
-    /// fn pause_system(mut counter: ResMut<Counter>) {
-    ///     counter.0 -= 1;
-    /// }
-    ///
-    /// // We default to `GameState::Playing` so `play_system` runs
-    /// app.run(&mut world);
-    /// assert_eq!(world.resource::<Counter>().0, 1);
-    ///
-    /// *world.resource_mut::<State<GameState>>() = State::new(GameState::Paused);
-    ///
-    /// // Now that we are in `GameState::Pause`, `pause_system` will run
-    /// app.run(&mut world);
-    /// assert_eq!(world.resource::<Counter>().0, 0);
-    /// ```
-    pub fn in_state<S: States>(state: S) -> impl FnMut(Res<State<S>>) -> bool + Clone {
-        move |current_state: Res<State<S>>| *current_state == state
-    }
-
-    /// Generates a [`Condition`](super::Condition)-satisfying closure that returns `true`
-    /// if the state machine exists and is currently in `state`.
-    ///
-    /// The condition will return `false` if the state does not exist.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// # use bevy_ecs::prelude::*;
-    /// # #[derive(Resource, Default)]
-    /// # struct Counter(u8);
-    /// # let mut app = Schedule::default();
-    /// # let mut world = World::new();
-    /// # world.init_resource::<Counter>();
-    /// #[derive(States, Clone, Copy, Default, Eq, PartialEq, Hash, Debug)]
-    /// enum GameState {
-    ///     #[default]
-    ///     Playing,
-    ///     Paused,
-    /// }
-    ///
-    /// app.add_systems((
-    ///     // `state_exists_and_equals` will only return true if the
-    ///     // given state exists and equals the given value
-    ///     play_system.run_if(state_exists_and_equals(GameState::Playing)),
-    ///     pause_system.run_if(state_exists_and_equals(GameState::Paused)),
-    /// ));
-    ///
-    /// fn play_system(mut counter: ResMut<Counter>) {
-    ///     counter.0 += 1;
-    /// }
-    ///
-    /// fn pause_system(mut counter: ResMut<Counter>) {
-    ///     counter.0 -= 1;
-    /// }
-    ///
-    /// // `GameState` does not yet exists so neither system will run
-    /// app.run(&mut world);
-    /// assert_eq!(world.resource::<Counter>().0, 0);
-    ///
-    /// world.init_resource::<State<GameState>>();
-    ///
-    /// // We default to `GameState::Playing` so `play_system` runs
-    /// app.run(&mut world);
-    /// assert_eq!(world.resource::<Counter>().0, 1);
-    ///
-    /// *world.resource_mut::<State<GameState>>() = State::new(GameState::Paused);
-    ///
-    /// // Now that we are in `GameState::Pause`, `pause_system` will run
-    /// app.run(&mut world);
-    /// assert_eq!(world.resource::<Counter>().0, 0);
-    /// ```
-    pub fn state_exists_and_equals<S: States>(
-        state: S,
-    ) -> impl FnMut(Option<Res<State<S>>>) -> bool + Clone {
-        move |current_state: Option<Res<State<S>>>| match current_state {
-            Some(current_state) => *current_state == state,
-            None => false,
-        }
-    }
-
-    /// Generates a [`Condition`](super::Condition)-satisfying closure that returns `true`
-    /// if the state machine changed state.
-    ///
-    /// To do things on transitions to/from specific states, use their respective OnEnter/OnExit
-    /// schedules. Use this run condition if you want to detect any change, regardless of the value.
-    ///
-    /// # Panics
-    ///
-    /// The condition will panic if the resource does not exist.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// # use bevy_ecs::prelude::*;
-    /// # #[derive(Resource, Default)]
-    /// # struct Counter(u8);
-    /// # let mut app = Schedule::default();
-    /// # let mut world = World::new();
-    /// # world.init_resource::<Counter>();
-    /// #[derive(States, Clone, Copy, Default, Eq, PartialEq, Hash, Debug)]
-    /// enum GameState {
-    ///     #[default]
-    ///     Playing,
-    ///     Paused,
-    /// }
-    ///
-    /// world.init_resource::<State<GameState>>();
-    ///
-    /// app.add_systems(
-    ///     // `state_changed` will only return true if the
-    ///     // given states value has just been updated or
-    ///     // the state has just been added
-    ///     my_system.run_if(state_changed::<GameState>()),
-    /// );
-    ///
-    /// fn my_system(mut counter: ResMut<Counter>) {
-    ///     counter.0 += 1;
-    /// }
-    ///
-    /// // `GameState` has just been added so `my_system` will run
-    /// app.run(&mut world);
-    /// assert_eq!(world.resource::<Counter>().0, 1);
-    ///
-    /// // `GameState` has not been updated so `my_system` will not run
-    /// app.run(&mut world);
-    /// assert_eq!(world.resource::<Counter>().0, 1);
-    ///
-    /// *world.resource_mut::<State<GameState>>() = State::new(GameState::Paused);
-    ///
-    /// // Now that `GameState` has been updated `my_system` will run
-    /// app.run(&mut world);
-    /// assert_eq!(world.resource::<Counter>().0, 2);
-    /// ```
-    pub fn state_changed<S: States>() -> impl FnMut(Res<State<S>>) -> bool + Clone {
-        move |current_state: Res<State<S>>| current_state.is_changed()
-    }
-
-    /// Generates a [`Condition`](super::Condition)-satisfying closure that returns `true`
     /// if there are any new events of the given type since it was last called.
     ///
     /// # Example
@@ -867,7 +667,7 @@ pub mod common_conditions {
     /// # let mut world = World::new();
     /// # world.init_resource::<Counter>();
     /// # world.init_resource::<Events<MyEvent>>();
-    /// # app.add_systems(Events::<MyEvent>::update_system.before(my_system));
+    /// # app.add_systems(bevy_ecs::event::event_update_system.before(my_system));
     ///
     /// app.add_systems(
     ///     my_system.run_if(on_event::<MyEvent>()),
@@ -898,7 +698,7 @@ pub mod common_conditions {
         move |mut reader: EventReader<T>| reader.read().count() > 0
     }
 
-    /// Generates a [`Condition`](super::Condition)-satisfying closure that returns `true`
+    /// A [`Condition`](super::Condition)-satisfying system that returns `true`
     /// if there are any entities with the given component type.
     ///
     /// # Example
@@ -911,7 +711,7 @@ pub mod common_conditions {
     /// # let mut world = World::new();
     /// # world.init_resource::<Counter>();
     /// app.add_systems(
-    ///     my_system.run_if(any_with_component::<MyComponent>()),
+    ///     my_system.run_if(any_with_component::<MyComponent>),
     /// );
     ///
     /// #[derive(Component)]
@@ -931,8 +731,8 @@ pub mod common_conditions {
     /// app.run(&mut world);
     /// assert_eq!(world.resource::<Counter>().0, 1);
     /// ```
-    pub fn any_with_component<T: Component>() -> impl FnMut(Query<(), With<T>>) -> bool + Clone {
-        move |query: Query<(), With<T>>| !query.is_empty()
+    pub fn any_with_component<T: Component>(query: Query<(), With<T>>) -> bool {
+        !query.is_empty()
     }
 
     /// Generates a [`Condition`](super::Condition)-satisfying closure that returns `true`
@@ -943,7 +743,7 @@ pub mod common_conditions {
         // Simply checking `is_empty` would not be enough.
         // PERF: note that `count` is efficient (not actually looping/iterating),
         // due to Bevy having a specialized implementation for events.
-        move |mut removals: RemovedComponents<T>| removals.iter().count() != 0
+        move |mut removals: RemovedComponents<T>| removals.read().count() != 0
     }
 
     /// Generates a [`Condition`](super::Condition) that inverses the result of passed one.
@@ -1062,7 +862,6 @@ mod tests {
     use crate as bevy_ecs;
     use crate::component::Component;
     use crate::schedule::IntoSystemConfigs;
-    use crate::schedule::{common_conditions::not, State, States};
     use crate::system::Local;
     use crate::{change_detection::ResMut, schedule::Schedule, world::World};
     use bevy_ecs_macros::Event;
@@ -1096,7 +895,7 @@ mod tests {
         schedule.run(&mut world);
         assert_eq!(world.resource::<Counter>().0, 2);
 
-        // Run every other cycle oppsite to the last one
+        // Run every other cycle opposite to the last one
         schedule.add_systems(increment_counter.run_if(not(every_other_time)));
 
         schedule.run(&mut world);
@@ -1161,19 +960,14 @@ mod tests {
         schedule.run(&mut world);
         assert_eq!(world.resource::<Counter>().0, 0);
     }
-
-    #[derive(States, PartialEq, Eq, Debug, Default, Hash, Clone)]
-    enum TestState {
-        #[default]
-        A,
-        B,
-    }
-
     #[derive(Component)]
     struct TestComponent;
 
     #[derive(Event)]
     struct TestEvent;
+
+    #[derive(Resource)]
+    struct TestResource(());
 
     fn test_system() {}
 
@@ -1183,17 +977,14 @@ mod tests {
         Schedule::default().add_systems(
             (test_system, test_system)
                 .distributive_run_if(run_once())
-                .distributive_run_if(resource_exists::<State<TestState>>())
-                .distributive_run_if(resource_added::<State<TestState>>())
-                .distributive_run_if(resource_changed::<State<TestState>>())
-                .distributive_run_if(resource_exists_and_changed::<State<TestState>>())
-                .distributive_run_if(resource_changed_or_removed::<State<TestState>>())
-                .distributive_run_if(resource_removed::<State<TestState>>())
-                .distributive_run_if(state_exists::<TestState>())
-                .distributive_run_if(in_state(TestState::A))
-                .distributive_run_if(state_changed::<TestState>())
+                .distributive_run_if(resource_exists::<TestResource>)
+                .distributive_run_if(resource_added::<TestResource>)
+                .distributive_run_if(resource_changed::<TestResource>)
+                .distributive_run_if(resource_exists_and_changed::<TestResource>)
+                .distributive_run_if(resource_changed_or_removed::<TestResource>())
+                .distributive_run_if(resource_removed::<TestResource>())
                 .distributive_run_if(on_event::<TestEvent>())
-                .distributive_run_if(any_with_component::<TestComponent>())
+                .distributive_run_if(any_with_component::<TestComponent>)
                 .distributive_run_if(not(run_once())),
         );
     }

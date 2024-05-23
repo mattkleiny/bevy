@@ -1,8 +1,18 @@
 //! Event handling types.
 
 use crate as bevy_ecs;
-use crate::system::{Local, Res, ResMut, Resource, SystemParam};
+use crate::batching::BatchingStrategy;
+use crate::change_detection::MutUntyped;
+use crate::{
+    change_detection::{DetectChangesMut, Mut},
+    component::{ComponentId, Tick},
+    system::{Local, Res, ResMut, Resource, SystemParam},
+    world::World,
+};
 pub use bevy_ecs_macros::Event;
+use bevy_ecs_macros::SystemSet;
+#[cfg(feature = "bevy_reflect")]
+use bevy_reflect::Reflect;
 use bevy_utils::detailed_trace;
 use std::ops::{Deref, DerefMut};
 use std::{
@@ -13,6 +23,7 @@ use std::{
     marker::PhantomData,
     slice::Iter,
 };
+
 /// A type that can be stored in an [`Events<E>`] resource
 /// You can conveniently access events using the [`EventReader`] and [`EventWriter`] system parameter.
 ///
@@ -22,17 +33,20 @@ pub trait Event: Send + Sync + 'static {}
 /// An `EventId` uniquely identifies an event stored in a specific [`World`].
 ///
 /// An `EventId` can among other things be used to trace the flow of an event from the point it was
-/// sent to the point it was processed.
+/// sent to the point it was processed. `EventId`s increase montonically by send order.
 ///
 /// [`World`]: crate::world::World
+#[cfg_attr(feature = "bevy_reflect", derive(Reflect))]
 pub struct EventId<E: Event> {
     /// Uniquely identifies the event associated with this ID.
     // This value corresponds to the order in which each event was added to the world.
     pub id: usize,
+    #[cfg_attr(feature = "bevy_reflect", reflect(ignore))]
     _marker: PhantomData<E>,
 }
 
 impl<E: Event> Copy for EventId<E> {}
+
 impl<E: Event> Clone for EventId<E> {
     fn clone(&self) -> Self {
         *self
@@ -83,6 +97,7 @@ impl<E: Event> Hash for EventId<E> {
 }
 
 #[derive(Debug)]
+#[cfg_attr(feature = "bevy_reflect", derive(Reflect))]
 struct EventInstance<E: Event> {
     pub event_id: EventId<E>,
     pub event: E,
@@ -103,7 +118,7 @@ struct EventInstance<E: Event> {
 /// This collection is meant to be paired with a system that calls
 /// [`Events::update`] exactly once per update/frame.
 ///
-/// [`Events::update_system`] is a system that does this, typically initialized automatically using
+/// [`event_update_system`] is a system that does this, typically initialized automatically using
 /// [`add_event`](https://docs.rs/bevy/*/bevy/app/struct.App.html#method.add_event).
 /// [`EventReader`]s are expected to read events from this collection at least once per loop/frame.
 /// Events will persist across a single frame boundary and so ordering of event producers and
@@ -131,12 +146,12 @@ struct EventInstance<E: Event> {
 /// events.send(MyEvent { value: 1 });
 ///
 /// // somewhere else: read the events
-/// for event in reader.iter(&events) {
+/// for event in reader.read(&events) {
 ///     assert_eq!(event.value, 1)
 /// }
 ///
 /// // events are only processed once per reader
-/// assert_eq!(reader.iter(&events).count(), 0);
+/// assert_eq!(reader.read(&events).count(), 0);
 /// ```
 ///
 /// # Details
@@ -161,9 +176,10 @@ struct EventInstance<E: Event> {
 /// [Example usage standalone.](https://github.com/bevyengine/bevy/blob/latest/crates/bevy_ecs/examples/events.rs)
 ///
 #[derive(Debug, Resource)]
+#[cfg_attr(feature = "bevy_reflect", derive(Reflect))]
 pub struct Events<E: Event> {
     /// Holds the oldest still active events.
-    /// Note that a.start_event_count + a.len() should always === events_b.start_event_count.
+    /// Note that `a.start_event_count + a.len()` should always be equal to `events_b.start_event_count`.
     events_a: EventSequence<E>,
     /// Holds the newer events.
     events_b: EventSequence<E>,
@@ -191,7 +207,8 @@ impl<E: Event> Events<E> {
 
     /// "Sends" an `event` by writing it to the current event buffer. [`EventReader`]s can then read
     /// the event.
-    pub fn send(&mut self, event: E) {
+    /// This method returns the [ID](`EventId`) of the sent `event`.
+    pub fn send(&mut self, event: E) -> EventId<E> {
         let event_id = EventId {
             id: self.event_count,
             _marker: PhantomData,
@@ -202,14 +219,32 @@ impl<E: Event> Events<E> {
 
         self.events_b.push(event_instance);
         self.event_count += 1;
+
+        event_id
+    }
+
+    /// Sends a list of `events` all at once, which can later be read by [`EventReader`]s.
+    /// This is more efficient than sending each event individually.
+    /// This method returns the [IDs](`EventId`) of the sent `events`.
+    pub fn send_batch(&mut self, events: impl IntoIterator<Item = E>) -> SendBatchIds<E> {
+        let last_count = self.event_count;
+
+        self.extend(events);
+
+        SendBatchIds {
+            last_count,
+            event_count: self.event_count,
+            _marker: PhantomData,
+        }
     }
 
     /// Sends the default value of the event. Useful when the event is an empty struct.
-    pub fn send_default(&mut self)
+    /// This method returns the [ID](`EventId`) of the sent `event`.
+    pub fn send_default(&mut self) -> EventId<E>
     where
         E: Default,
     {
-        self.send(Default::default());
+        self.send(Default::default())
     }
 
     /// Gets a new [`ManualEventReader`]. This will include all events already in the event buffers.
@@ -231,7 +266,13 @@ impl<E: Event> Events<E> {
     ///
     /// If you need access to the events that were removed, consider using [`Events::update_drain`].
     pub fn update(&mut self) {
-        let _ = self.update_drain();
+        std::mem::swap(&mut self.events_a, &mut self.events_b);
+        self.events_b.clear();
+        self.events_b.start_event_count = self.event_count;
+        debug_assert_eq!(
+            self.events_a.start_event_count + self.events_a.len(),
+            self.events_b.start_event_count
+        );
     }
 
     /// Swaps the event buffers and drains the oldest event buffer, returning an iterator
@@ -249,11 +290,6 @@ impl<E: Event> Events<E> {
         );
 
         iter.map(|e| e.event)
-    }
-
-    /// A system that calls [`Events::update`] once per frame.
-    pub fn update_system(mut events: ResMut<Self>) {
-        events.update();
     }
 
     #[inline]
@@ -332,7 +368,7 @@ impl<E: Event> Events<E> {
     }
 }
 
-impl<E: Event> std::iter::Extend<E> for Events<E> {
+impl<E: Event> Extend<E> for Events<E> {
     fn extend<I>(&mut self, iter: I)
     where
         I: IntoIterator<Item = E>,
@@ -363,6 +399,7 @@ impl<E: Event> std::iter::Extend<E> for Events<E> {
 }
 
 #[derive(Debug)]
+#[cfg_attr(feature = "bevy_reflect", derive(Reflect))]
 struct EventSequence<E: Event> {
     events: Vec<EventInstance<E>>,
     start_event_count: usize,
@@ -393,6 +430,11 @@ impl<E: Event> DerefMut for EventSequence<E> {
 }
 
 /// Reads events of type `T` in order and tracks which events have already been read.
+///
+/// # Concurrency
+///
+/// Unlike [`EventWriter<T>`], systems with `EventReader<T>` param can be executed concurrently
+/// (but not concurrently with `EventWriter<T>` systems for the same event type).
 #[derive(SystemParam, Debug)]
 pub struct EventReader<'w, 's, E: Event> {
     reader: Local<'s, ManualEventReader<E>>,
@@ -407,23 +449,49 @@ impl<'w, 's, E: Event> EventReader<'w, 's, E> {
         self.reader.read(&self.events)
     }
 
-    /// Iterates over the events this [`EventReader`] has not seen yet. This updates the
-    /// [`EventReader`]'s event counter, which means subsequent event reads will not include events
-    /// that happened before now.
-    #[deprecated = "use `.read()` instead."]
-    pub fn iter(&mut self) -> EventIterator<'_, E> {
-        self.reader.read(&self.events)
-    }
-
     /// Like [`read`](Self::read), except also returning the [`EventId`] of the events.
     pub fn read_with_id(&mut self) -> EventIteratorWithId<'_, E> {
         self.reader.read_with_id(&self.events)
     }
 
-    /// Like [`iter`](Self::iter), except also returning the [`EventId`] of the events.
-    #[deprecated = "use `.read_with_id() instead."]
-    pub fn iter_with_id(&mut self) -> EventIteratorWithId<'_, E> {
-        self.reader.read_with_id(&self.events)
+    /// Returns a parallel iterator over the events this [`EventReader`] has not seen yet.
+    /// See also [`for_each`](EventParIter::for_each).
+    ///
+    /// # Example
+    /// ```
+    /// # use bevy_ecs::prelude::*;
+    /// # use std::sync::atomic::{AtomicUsize, Ordering};
+    ///
+    /// #[derive(Event)]
+    /// struct MyEvent {
+    ///     value: usize,
+    /// }
+    ///
+    /// #[derive(Resource, Default)]
+    /// struct Counter(AtomicUsize);
+    ///
+    /// // setup
+    /// let mut world = World::new();
+    /// world.init_resource::<Events<MyEvent>>();
+    /// world.insert_resource(Counter::default());
+    ///
+    /// let mut schedule = Schedule::default();
+    /// schedule.add_systems(|mut events: EventReader<MyEvent>, counter: Res<Counter>| {
+    ///     events.par_read().for_each(|MyEvent { value }| {
+    ///         counter.0.fetch_add(*value, Ordering::Relaxed);
+    ///     });
+    /// });
+    /// for value in 0..100 {
+    ///     world.send_event(MyEvent { value });
+    /// }
+    /// schedule.run(&mut world);
+    /// let Counter(counter) = world.remove_resource::<Counter>().unwrap();
+    /// // all events were processed
+    /// assert_eq!(counter.into_inner(), 4950);
+    /// ```
+    ///
+    pub fn par_read(&mut self) -> EventParIter<'_, E> {
+        self.reader.par_read(&self.events)
     }
 
     /// Determines the number of events available to be read from this [`EventReader`] without consuming any.
@@ -458,8 +526,8 @@ impl<'w, 's, E: Event> EventReader<'w, 's, E> {
 
     /// Consumes all available events.
     ///
-    /// This means these events will not appear in calls to [`EventReader::iter()`] or
-    /// [`EventReader::iter_with_id()`] and [`EventReader::is_empty()`] will return `true`.
+    /// This means these events will not appear in calls to [`EventReader::read()`] or
+    /// [`EventReader::read_with_id()`] and [`EventReader::is_empty()`] will return `true`.
     ///
     /// For usage, see [`EventReader::is_empty()`].
     pub fn clear(&mut self) {
@@ -484,7 +552,12 @@ impl<'w, 's, E: Event> EventReader<'w, 's, E> {
 /// # bevy_ecs::system::assert_is_system(my_system);
 /// ```
 ///
-/// # Limitations
+/// # Concurrency
+///
+/// `EventWriter` param has [`ResMut<Events<T>>`](Events) inside. So two systems declaring `EventWriter<T>` params
+/// for the same event type won't be executed concurrently.
+///
+/// # Untyped events
 ///
 /// `EventWriter` can only send events of one specific type, which must be known at compile-time.
 /// This is not a problem most of the time, but you may find a situation where you cannot know
@@ -517,31 +590,75 @@ pub struct EventWriter<'w, E: Event> {
 
 impl<'w, E: Event> EventWriter<'w, E> {
     /// Sends an `event`, which can later be read by [`EventReader`]s.
+    /// This method returns the [ID](`EventId`) of the sent `event`.
     ///
     /// See [`Events`] for details.
-    pub fn send(&mut self, event: E) {
-        self.events.send(event);
+    pub fn send(&mut self, event: E) -> EventId<E> {
+        self.events.send(event)
     }
 
     /// Sends a list of `events` all at once, which can later be read by [`EventReader`]s.
     /// This is more efficient than sending each event individually.
+    /// This method returns the [IDs](`EventId`) of the sent `events`.
     ///
     /// See [`Events`] for details.
-    pub fn send_batch(&mut self, events: impl IntoIterator<Item = E>) {
-        self.events.extend(events);
+    pub fn send_batch(&mut self, events: impl IntoIterator<Item = E>) -> SendBatchIds<E> {
+        self.events.send_batch(events)
     }
 
     /// Sends the default value of the event. Useful when the event is an empty struct.
-    pub fn send_default(&mut self)
+    /// This method returns the [ID](`EventId`) of the sent `event`.
+    ///
+    /// See [`Events`] for details.
+    pub fn send_default(&mut self) -> EventId<E>
     where
         E: Default,
     {
-        self.events.send_default();
+        self.events.send_default()
     }
 }
 
 /// Stores the state for an [`EventReader`].
+///
 /// Access to the [`Events<E>`] resource is required to read any incoming events.
+///
+/// In almost all cases, you should just use an [`EventReader`],
+/// which will automatically manage the state for you.
+///
+/// However, this type can be useful if you need to manually track events,
+/// such as when you're attempting to send and receive events of the same type in the same system.
+///
+/// # Example
+///
+/// ```
+/// use bevy_ecs::prelude::*;
+/// use bevy_ecs::event::{Event, Events, ManualEventReader};
+///
+/// #[derive(Event, Clone, Debug)]
+/// struct MyEvent;
+///
+/// /// A system that both sends and receives events using a [`Local`] [`ManualEventReader`].
+/// fn send_and_receive_manual_event_reader(
+///     // The `Local` `SystemParam` stores state inside the system itself, rather than in the world.
+///     // `ManualEventReader<T>` is the internal state of `EventReader<T>`, which tracks which events have been seen.
+///     mut local_event_reader: Local<ManualEventReader<MyEvent>>,
+///     // We can access the `Events` resource mutably, allowing us to both read and write its contents.
+///     mut events: ResMut<Events<MyEvent>>,
+/// ) {
+///     // We must collect the events to resend, because we can't mutate events while we're iterating over the events.
+///     let mut events_to_resend = Vec::new();
+///
+///     for event in local_event_reader.read(&events) {
+///          events_to_resend.push(event.clone());
+///     }
+///
+///     for event in events_to_resend {
+///         events.send(MyEvent);
+///     }
+/// }
+///
+/// # bevy_ecs::system::assert_is_system(send_and_receive_manual_event_reader);
+/// ```
 #[derive(Debug)]
 pub struct ManualEventReader<E: Event> {
     last_event_count: usize,
@@ -557,16 +674,19 @@ impl<E: Event> Default for ManualEventReader<E> {
     }
 }
 
+impl<E: Event> Clone for ManualEventReader<E> {
+    fn clone(&self) -> Self {
+        ManualEventReader {
+            last_event_count: self.last_event_count,
+            _marker: PhantomData,
+        }
+    }
+}
+
 #[allow(clippy::len_without_is_empty)] // Check fails since the is_empty implementation has a signature other than `(&self) -> bool`
 impl<E: Event> ManualEventReader<E> {
     /// See [`EventReader::read`]
     pub fn read<'a>(&'a mut self, events: &'a Events<E>) -> EventIterator<'a, E> {
-        self.read_with_id(events).without_id()
-    }
-
-    /// See [`EventReader::iter`]
-    #[deprecated = "use `.read()` instead."]
-    pub fn iter<'a>(&'a mut self, events: &'a Events<E>) -> EventIterator<'a, E> {
         self.read_with_id(events).without_id()
     }
 
@@ -575,10 +695,9 @@ impl<E: Event> ManualEventReader<E> {
         EventIteratorWithId::new(self, events)
     }
 
-    /// See [`EventReader::iter_with_id`]
-    #[deprecated = "use `.read_with_id() instead."]
-    pub fn iter_with_id<'a>(&'a mut self, events: &'a Events<E>) -> EventIteratorWithId<'a, E> {
-        EventIteratorWithId::new(self, events)
+    /// See [`EventReader::par_read`]
+    pub fn par_read<'a>(&'a mut self, events: &'a Events<E>) -> EventParIter<'a, E> {
+        EventParIter::new(self, events)
     }
 
     /// See [`EventReader::len`]
@@ -617,21 +736,18 @@ pub struct EventIterator<'a, E: Event> {
     iter: EventIteratorWithId<'a, E>,
 }
 
-/// An iterator that yields any unread events from an [`EventReader`] or [`ManualEventReader`].
-///
-/// This is a type alias for [`EventIterator`], which used to be called `ManualEventIterator`.
-/// This type alias will be removed in the next release of bevy, so you should use [`EventIterator`] directly instead.
-#[deprecated = "This type has been renamed to `EventIterator`."]
-pub type ManualEventIterator<'a, E> = EventIterator<'a, E>;
-
 impl<'a, E: Event> Iterator for EventIterator<'a, E> {
     type Item = &'a E;
     fn next(&mut self) -> Option<Self::Item> {
         self.iter.next().map(|(event, _)| event)
     }
 
-    fn nth(&mut self, n: usize) -> Option<Self::Item> {
-        self.iter.nth(n).map(|(event, _)| event)
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.iter.size_hint()
+    }
+
+    fn count(self) -> usize {
+        self.iter.count()
     }
 
     fn last(self) -> Option<Self::Item>
@@ -641,12 +757,8 @@ impl<'a, E: Event> Iterator for EventIterator<'a, E> {
         self.iter.last().map(|(event, _)| event)
     }
 
-    fn count(self) -> usize {
-        self.iter.count()
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.iter.size_hint()
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        self.iter.nth(n).map(|(event, _)| event)
     }
 }
 
@@ -664,18 +776,15 @@ pub struct EventIteratorWithId<'a, E: Event> {
     unread: usize,
 }
 
-/// An iterator that yields any unread events (and their IDs) from an [`EventReader`] or [`ManualEventReader`].
-///
-/// This is a type alias for [`EventIteratorWithId`], which used to be called `ManualEventIteratorWithId`.
-/// This type alias will be removed in the next release of bevy, so you should use [`EventIteratorWithId`] directly instead.
-#[deprecated = "This type has been renamed to `EventIteratorWithId`."]
-pub type ManualEventIteratorWithId<'a, E> = EventIteratorWithId<'a, E>;
-
 impl<'a, E: Event> EventIteratorWithId<'a, E> {
     /// Creates a new iterator that yields any `events` that have not yet been seen by `reader`.
     pub fn new(reader: &'a mut ManualEventReader<E>, events: &'a Events<E>) -> Self {
-        let a_index = (reader.last_event_count).saturating_sub(events.events_a.start_event_count);
-        let b_index = (reader.last_event_count).saturating_sub(events.events_b.start_event_count);
+        let a_index = reader
+            .last_event_count
+            .saturating_sub(events.events_a.start_event_count);
+        let b_index = reader
+            .last_event_count
+            .saturating_sub(events.events_b.start_event_count);
         let a = events.events_a.get(a_index..).unwrap_or_default();
         let b = events.events_b.get(b_index..).unwrap_or_default();
 
@@ -717,16 +826,13 @@ impl<'a, E: Event> Iterator for EventIteratorWithId<'a, E> {
         }
     }
 
-    fn nth(&mut self, n: usize) -> Option<Self::Item> {
-        if let Some(EventInstance { event_id, event }) = self.chain.nth(n) {
-            self.reader.last_event_count += n + 1;
-            self.unread -= n + 1;
-            Some((event, *event_id))
-        } else {
-            self.reader.last_event_count += self.unread;
-            self.unread = 0;
-            None
-        }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.chain.size_hint()
+    }
+
+    fn count(self) -> usize {
+        self.reader.last_event_count += self.unread;
+        self.unread
     }
 
     fn last(self) -> Option<Self::Item>
@@ -738,19 +844,269 @@ impl<'a, E: Event> Iterator for EventIteratorWithId<'a, E> {
         Some((event, *event_id))
     }
 
-    fn count(self) -> usize {
-        self.reader.last_event_count += self.unread;
-        self.unread
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.chain.size_hint()
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        if let Some(EventInstance { event_id, event }) = self.chain.nth(n) {
+            self.reader.last_event_count += n + 1;
+            self.unread -= n + 1;
+            Some((event, *event_id))
+        } else {
+            self.reader.last_event_count += self.unread;
+            self.unread = 0;
+            None
+        }
     }
 }
 
 impl<'a, E: Event> ExactSizeIterator for EventIteratorWithId<'a, E> {
     fn len(&self) -> usize {
         self.unread
+    }
+}
+
+/// A parallel iterator over `Event`s.
+#[derive(Debug)]
+pub struct EventParIter<'a, E: Event> {
+    reader: &'a mut ManualEventReader<E>,
+    slices: [&'a [EventInstance<E>]; 2],
+    batching_strategy: BatchingStrategy,
+}
+
+impl<'a, E: Event> EventParIter<'a, E> {
+    /// Creates a new parallel iterator over `events` that have not yet been seen by `reader`.
+    pub fn new(reader: &'a mut ManualEventReader<E>, events: &'a Events<E>) -> Self {
+        let a_index = reader
+            .last_event_count
+            .saturating_sub(events.events_a.start_event_count);
+        let b_index = reader
+            .last_event_count
+            .saturating_sub(events.events_b.start_event_count);
+        let a = events.events_a.get(a_index..).unwrap_or_default();
+        let b = events.events_b.get(b_index..).unwrap_or_default();
+
+        let unread_count = a.len() + b.len();
+        // Ensure `len` is implemented correctly
+        debug_assert_eq!(unread_count, reader.len(events));
+        reader.last_event_count = events.event_count - unread_count;
+
+        Self {
+            reader,
+            slices: [a, b],
+            batching_strategy: BatchingStrategy::default(),
+        }
+    }
+
+    /// Changes the batching strategy used when iterating.
+    ///
+    /// For more information on how this affects the resultant iteration, see
+    /// [`BatchingStrategy`].
+    pub fn batching_strategy(mut self, strategy: BatchingStrategy) -> Self {
+        self.batching_strategy = strategy;
+        self
+    }
+
+    /// Runs the provided closure for each unread event in parallel.
+    ///
+    /// Unlike normal iteration, the event order is not guaranteed in any form.
+    ///
+    /// # Panics
+    /// If the [`ComputeTaskPool`] is not initialized. If using this from an event reader that is being
+    /// initialized and run from the ECS scheduler, this should never panic.
+    ///
+    /// [`ComputeTaskPool`]: bevy_tasks::ComputeTaskPool
+    pub fn for_each<FN: Fn(&'a E) + Send + Sync + Clone>(self, func: FN) {
+        self.for_each_with_id(move |e, _| func(e));
+    }
+
+    /// Runs the provided closure for each unread event in parallel, like [`for_each`](Self::for_each),
+    /// but additionally provides the `EventId` to the closure.
+    ///
+    /// Note that the order of iteration is not guaranteed, but `EventId`s are ordered by send order.
+    ///
+    /// # Panics
+    /// If the [`ComputeTaskPool`] is not initialized. If using this from an event reader that is being
+    /// initialized and run from the ECS scheduler, this should never panic.
+    ///
+    /// [`ComputeTaskPool`]: bevy_tasks::ComputeTaskPool
+    pub fn for_each_with_id<FN: Fn(&'a E, EventId<E>) + Send + Sync + Clone>(self, func: FN) {
+        #[cfg(any(target_arch = "wasm32", not(feature = "multi_threaded")))]
+        {
+            self.into_iter().for_each(|(e, i)| func(e, i));
+        }
+
+        #[cfg(all(not(target_arch = "wasm32"), feature = "multi_threaded"))]
+        {
+            let pool = bevy_tasks::ComputeTaskPool::get();
+            let thread_count = pool.thread_num();
+            if thread_count <= 1 {
+                return self.into_iter().for_each(|(e, i)| func(e, i));
+            }
+
+            let batch_size = self
+                .batching_strategy
+                .calc_batch_size(|| self.len(), thread_count);
+            let chunks = self.slices.map(|s| s.chunks_exact(batch_size));
+            let remainders = chunks.each_ref().map(|c| c.remainder());
+
+            pool.scope(|scope| {
+                for batch in chunks.into_iter().flatten().chain(remainders) {
+                    let func = func.clone();
+                    scope.spawn(async move {
+                        for event in batch {
+                            func(&event.event, event.event_id);
+                        }
+                    });
+                }
+            });
+        }
+    }
+
+    /// Returns the number of [`Event`]s to be iterated.
+    pub fn len(&self) -> usize {
+        self.slices.iter().map(|s| s.len()).sum()
+    }
+
+    /// Returns [`true`] if there are no events remaining in this iterator.
+    pub fn is_empty(&self) -> bool {
+        self.slices.iter().all(|x| x.is_empty())
+    }
+}
+
+impl<'a, E: Event> IntoIterator for EventParIter<'a, E> {
+    type IntoIter = EventIteratorWithId<'a, E>;
+    type Item = <Self::IntoIter as Iterator>::Item;
+
+    fn into_iter(self) -> Self::IntoIter {
+        let EventParIter {
+            reader,
+            slices: [a, b],
+            ..
+        } = self;
+        let unread = a.len() + b.len();
+        let chain = a.iter().chain(b);
+        EventIteratorWithId {
+            reader,
+            chain,
+            unread,
+        }
+    }
+}
+
+#[doc(hidden)]
+struct RegisteredEvent {
+    component_id: ComponentId,
+    // Required to flush the secondary buffer and drop events even if left unchanged.
+    previously_updated: bool,
+    // SAFETY: The component ID and the function must be used to fetch the Events<T> resource
+    // of the same type initialized in `register_event`, or improper type casts will occur.
+    update: unsafe fn(MutUntyped),
+}
+
+/// A registry of all of the [`Events`] in the [`World`], used by [`event_update_system`]
+/// to update all of the events.
+#[derive(Resource, Default)]
+pub struct EventRegistry {
+    needs_update: bool,
+    event_updates: Vec<RegisteredEvent>,
+}
+
+impl EventRegistry {
+    /// Registers an event type to be updated.
+    pub fn register_event<T: Event>(world: &mut World) {
+        // By initializing the resource here, we can be sure that it is present,
+        // and receive the correct, up-to-date `ComponentId` even if it was previously removed.
+        let component_id = world.init_resource::<Events<T>>();
+        let mut registry = world.get_resource_or_insert_with(Self::default);
+        registry.event_updates.push(RegisteredEvent {
+            component_id,
+            previously_updated: false,
+            update: |ptr| {
+                // SAFETY: The resource was initialized with the type Events<T>.
+                unsafe { ptr.with_type::<Events<T>>() }
+                    .bypass_change_detection()
+                    .update();
+            },
+        });
+    }
+
+    /// Updates all of the registered events in the World.
+    pub fn run_updates(&mut self, world: &mut World, last_change_tick: Tick) {
+        for registered_event in &mut self.event_updates {
+            // Bypass the type ID -> Component ID lookup with the cached component ID.
+            if let Some(events) = world.get_resource_mut_by_id(registered_event.component_id) {
+                let has_changed = events.has_changed_since(last_change_tick);
+                if registered_event.previously_updated || has_changed {
+                    // SAFETY: The update function pointer is called with the resource
+                    // fetched from the same component ID.
+                    unsafe { (registered_event.update)(events) };
+                    // Always set to true if the events have changed, otherwise disable running on the second invocation
+                    // to wait for more changes.
+                    registered_event.previously_updated =
+                        has_changed || !registered_event.previously_updated;
+                }
+            }
+        }
+    }
+}
+
+#[doc(hidden)]
+#[derive(SystemSet, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct EventUpdates;
+
+/// Signals the [`event_update_system`] to run after `FixedUpdate` systems.
+pub fn signal_event_update_system(signal: Option<ResMut<EventRegistry>>) {
+    if let Some(mut registry) = signal {
+        registry.needs_update = true;
+    }
+}
+
+/// A system that calls [`Events::update`] on all registered [`Events`] in the world.
+pub fn event_update_system(world: &mut World, mut last_change_tick: Local<Tick>) {
+    if world.contains_resource::<EventRegistry>() {
+        world.resource_scope(|world, mut registry: Mut<EventRegistry>| {
+            registry.run_updates(world, *last_change_tick);
+            // Disable the system until signal_event_update_system runs again.
+            registry.needs_update = false;
+        });
+    }
+    *last_change_tick = world.change_tick();
+}
+
+/// A run condition for [`event_update_system`].
+pub fn event_update_condition(signal: Option<Res<EventRegistry>>) -> bool {
+    // If we haven't got a signal to update the events, but we *could* get such a signal
+    // return early and update the events later.
+    signal.map_or(false, |signal| signal.needs_update)
+}
+
+/// [`Iterator`] over sent [`EventIds`](`EventId`) from a batch.
+pub struct SendBatchIds<E> {
+    last_count: usize,
+    event_count: usize,
+    _marker: PhantomData<E>,
+}
+
+impl<E: Event> Iterator for SendBatchIds<E> {
+    type Item = EventId<E>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.last_count >= self.event_count {
+            return None;
+        }
+
+        let result = Some(EventId {
+            id: self.last_count,
+            _marker: PhantomData,
+        });
+
+        self.last_count += 1;
+
+        result
+    }
+}
+
+impl<E: Event> ExactSizeIterator for SendBatchIds<E> {
+    fn len(&self) -> usize {
+        self.event_count.saturating_sub(self.last_count)
     }
 }
 
@@ -1112,5 +1468,72 @@ mod tests {
         fn reader_system(_: EventReader<EmptyTestEvent>) {}
 
         assert_is_read_only_system(reader_system);
+    }
+
+    #[test]
+    fn test_send_events_ids() {
+        let mut events = Events::<TestEvent>::default();
+        let event_0 = TestEvent { i: 0 };
+        let event_1 = TestEvent { i: 1 };
+        let event_2 = TestEvent { i: 2 };
+
+        let event_0_id = events.send(event_0);
+
+        assert_eq!(
+            events.get_event(event_0_id.id),
+            Some((&event_0, event_0_id)),
+            "Getting a sent event by ID should return the original event"
+        );
+
+        let mut event_ids = events.send_batch([event_1, event_2]);
+
+        let event_id = event_ids.next().expect("Event 1 must have been sent");
+
+        assert_eq!(
+            events.get_event(event_id.id),
+            Some((&event_1, event_id)),
+            "Getting a sent event by ID should return the original event"
+        );
+
+        let event_id = event_ids.next().expect("Event 2 must have been sent");
+
+        assert_eq!(
+            events.get_event(event_id.id),
+            Some((&event_2, event_id)),
+            "Getting a sent event by ID should return the original event"
+        );
+
+        assert!(
+            event_ids.next().is_none(),
+            "Only sent two events; got more than two IDs"
+        );
+    }
+
+    #[cfg(feature = "multi_threaded")]
+    #[test]
+    fn test_events_par_iter() {
+        use std::{collections::HashSet, sync::mpsc};
+
+        use crate::prelude::*;
+
+        let mut world = World::new();
+        world.init_resource::<Events<TestEvent>>();
+        for i in 0..100 {
+            world.send_event(TestEvent { i });
+        }
+
+        let mut schedule = Schedule::default();
+
+        schedule.add_systems(|mut events: EventReader<TestEvent>| {
+            let (tx, rx) = mpsc::channel();
+            events.par_read().for_each(|event| {
+                tx.send(event.i).unwrap();
+            });
+            drop(tx);
+
+            let observed: HashSet<_> = rx.into_iter().collect();
+            assert_eq!(observed, HashSet::from_iter(0..100));
+        });
+        schedule.run(&mut world);
     }
 }
